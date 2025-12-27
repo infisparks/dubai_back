@@ -5,18 +5,16 @@ const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
 const app = express();
-
-// --- CONFIGURATION ---
 const PORT = process.env.PORT || 4000;
 
-// Initialize Stripe
+// Init Stripe
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('CRITICAL ERROR: STRIPE_SECRET_KEY is missing in .env');
   process.exit(1);
 }
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Initialize Supabase Admin (Service Role)
+// Init Supabase Admin
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error('CRITICAL ERROR: SUPABASE credentials missing in .env');
   process.exit(1);
@@ -24,80 +22,66 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
-    }
-  }
+  { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- MIDDLEWARE: CORS ---
-// Updated with your specific domains
+// CORS Config
 const allowedOrigins = [
-  'http://localhost:3000',                // Local Development
-  'https://www.investariseglobal.com',    // Main Production Frontend
-  'https://investariseglobal.com',        // Production Frontend (non-www)
-  'https://invest.infispark.in'           // Your other Origin
+  'http://localhost:3000',
+  'https://www.investariseglobal.com',
+  'https://investariseglobal.com',
+  'https://invest.infispark.in'
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, or Stripe webhooks)
     if (!origin) return callback(null, true);
-    
     if (allowedOrigins.indexOf(origin) === -1) {
-      var msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-      return callback(new Error(msg), false);
+      return callback(new Error('CORS Policy Error'), false);
     }
     return callback(null, true);
   }
 }));
 
-// --- ROUTE 1: STRIPE WEBHOOK (MUST BE DEFINED BEFORE JSON PARSER) ---
-// This route needs the RAW body to verify the signature.
+// --- STRIPE WEBHOOK ---
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error(`❌ Webhook Signature Error: ${err.message}`);
+    console.error(`Webhook Error: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle the event
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const userId = session.client_reference_id;
     const stripeSessionId = session.id;
+    // Check type from metadata (default to 'founder' if missing)
+    const userType = session.metadata.user_type || 'founder'; 
 
-    console.log(`💰 Payment received for User ID: ${userId}`);
+    console.log(`💰 Payment success for ${userType}: ${userId}`);
 
     try {
-      // 1. IDEMPOTENCY CHECK: Check if already paid to save resources
-      const { data: existingProfile, error: fetchError } = await supabase
-        .from('founder_profiles')
+      const tableName = userType === 'exhibitor' ? 'exhibitor_profiles' : 'founder_profiles';
+
+      // Idempotency Check
+      const { data: existing } = await supabase
+        .from(tableName)
         .select('payment_status')
         .eq('user_id', userId)
         .single();
 
-      if (fetchError && fetchError.code !== 'PGRST116') { // Ignore "Row not found" error
-        console.error('Error fetching profile:', fetchError);
-        throw fetchError; 
-      }
-
-      if (existingProfile && existingProfile.payment_status === 'paid') {
-        console.log('⚠️ User already marked as paid. Skipping update.');
+      if (existing && existing.payment_status === 'paid') {
+        console.log('⚠️ Already paid, skipping update.');
         return res.json({ received: true });
       }
 
-      // 2. UPDATE DATABASE (Service Role bypasses RLS)
-      const { error: updateError } = await supabase
-        .from('founder_profiles')
+      // Update Database
+      const { error } = await supabase
+        .from(tableName)
         .update({
           payment_status: 'paid',
           stripe_session_id: stripeSessionId,
@@ -105,78 +89,68 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         })
         .eq('user_id', userId);
 
-      if (updateError) {
-        console.error('❌ Database Update Failed:', updateError);
-        return res.status(500).send('Database update failed');
-      }
-
-      console.log('✅ Database updated successfully');
+      if (error) throw error;
+      console.log(`✅ ${tableName} updated successfully`);
 
     } catch (err) {
-      console.error('❌ Processing Error:', err);
-      return res.status(500).send('Internal Server Error');
+      console.error('❌ Database Update Error:', err);
+      return res.status(500).send('Database Error');
     }
   }
 
-  // Return a 200 response to acknowledge receipt of the event
   res.json({ received: true });
 });
 
-// --- MIDDLEWARE: JSON PARSER (FOR ALL OTHER ROUTES) ---
 app.use(express.json());
 
-// --- ROUTE 2: CREATE CHECKOUT SESSION ---
+// --- CHECKOUT ENDPOINT ---
 app.post('/create-checkout-session', async (req, res) => {
-  const { userId, email, companyName } = req.body;
+  const { userId, email, companyName, type } = req.body; 
 
-  // Basic Validation
-  if (!userId || !email) {
-    return res.status(400).json({ error: 'Missing userId or email' });
+  if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
+
+  // Logic to switch price and return URL based on user type
+  let unitAmount = 5000; // Default Founder Price ($50.00)
+  let productName = `Startup Verification: ${companyName}`;
+  let returnUrl = 'https://www.investariseglobal.com/founder-form-page';
+
+  if (type === 'exhibitor') {
+    unitAmount = 20000; // Exhibitor Price ($200.00) - Change this to your desired amount
+    productName = `Exhibitor Registration: ${companyName}`;
+    returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
 
   try {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       customer_email: email,
-      client_reference_id: userId, // Links payment to user in Webhook
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: `Startup Verification: ${companyName || 'Founder'}`,
-              description: 'Official Investarise Global Event Pass & Verification',
-            },
-            unit_amount: 5000, // $50.00 (in cents)
+      client_reference_id: userId,
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: productName,
+            description: 'Official Investarise Global Event Pass',
           },
-          quantity: 1,
+          unit_amount: unitAmount,
         },
-      ],
+        quantity: 1,
+      }],
       mode: 'payment',
-      // UPDATED REDIRECT URLS
-      success_url: `https://www.investariseglobal.com/founder-form-page?success=true`,
-      cancel_url: `https://www.investariseglobal.com/founder-form-page?canceled=true`,
+      success_url: `${returnUrl}?success=true`,
+      cancel_url: `${returnUrl}?canceled=true`,
       metadata: {
         company_name: companyName,
-        user_id: userId
+        user_id: userId,
+        user_type: type // Critical for webhook logic
       }
     });
 
     res.json({ url: session.url });
   } catch (error) {
-    console.error('❌ Error creating checkout session:', error);
+    console.error('❌ Stripe Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// --- ROUTE 3: HEALTH CHECK ---
-app.get('/', (req, res) => {
-  res.send('Infispark Payment Server is Running 🚀');
-});
-
-// --- START SERVER ---
-app.listen(PORT, () => {
-  console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   - Webhook endpoint: http://localhost:${PORT}/webhook`);
-  console.log(`   - Checkout endpoint: http://localhost:${PORT}/create-checkout-session`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
