@@ -6,79 +6,66 @@ const cors = require('cors');
 
 const app = express();
 
-// Initialize Stripe with your Secret Key (Store in .env file)
+// --- CONFIGURATION ---
+const PORT = process.env.PORT || 4000;
+
+// Initialize Stripe
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.error('CRITICAL ERROR: STRIPE_SECRET_KEY is missing in .env');
+  process.exit(1);
+}
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Initialize Supabase (Use SERVICE ROLE KEY for backend updates to bypass RLS)
+// Initialize Supabase Admin (Service Role)
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('CRITICAL ERROR: SUPABASE credentials missing in .env');
+  process.exit(1);
+}
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  }
 );
 
-// Middleware
-app.use(cors({ origin: 'http://localhost:3000' })); // Allow your Next.js frontend
+// --- MIDDLEWARE: CORS ---
+// Updated with your specific domains
+const allowedOrigins = [
+  'http://localhost:3000',                // Local Development
+  'https://www.investariseglobal.com',    // Main Production Frontend
+  'https://investariseglobal.com',        // Production Frontend (non-www)
+  'https://invest.infispark.in'           // Your other Origin
+];
 
-// Webhook requires raw body, API requires JSON
-app.use((req, res, next) => {
-  if (req.originalUrl === '/webhook') {
-    next();
-  } else {
-    express.json()(req, res, next);
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, or Stripe webhooks)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      var msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
   }
-});
+}));
 
-// 1. Create Checkout Session Endpoint
-app.post('/create-checkout-session', async (req, res) => {
-  const { userId, email, companyName } = req.body;
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      customer_email: email,
-      client_reference_id: userId, // CRITICAL: This links the payment to the user ID
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: `Startup Verification: ${companyName}`,
-              description: 'Official Investarise Global Event Pass & Verification',
-            },
-            unit_amount: 5000, // $50.00 (Amount in cents)
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'payment',
-      // Redirect URLs
-      success_url: `${process.env.CLIENT_URL}?success=true`,
-      cancel_url: `${process.env.CLIENT_URL}?canceled=true`,
-      metadata: {
-        company_name: companyName,
-        user_id: userId
-      }
-    });
-
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('Error creating checkout session:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 2. Stripe Webhook (Handle successful payment)
+// --- ROUTE 1: STRIPE WEBHOOK (MUST BE DEFINED BEFORE JSON PARSER) ---
+// This route needs the RAW body to verify the signature.
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
-    console.error(`Webhook Signature Error: ${err.message}`);
+    console.error(`❌ Webhook Signature Error: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -88,26 +75,108 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const userId = session.client_reference_id;
     const stripeSessionId = session.id;
 
-    console.log(`Payment successful for User: ${userId}`);
+    console.log(`💰 Payment received for User ID: ${userId}`);
 
-    // Update Supabase Database
-    const { error } = await supabase
-      .from('founder_profiles')
-      .update({
-        payment_status: 'paid',
-        stripe_session_id: stripeSessionId,
-        paid_at: new Date().toISOString()
-      })
-      .eq('user_id', userId);
+    try {
+      // 1. IDEMPOTENCY CHECK: Check if already paid to save resources
+      const { data: existingProfile, error: fetchError } = await supabase
+        .from('founder_profiles')
+        .select('payment_status')
+        .eq('user_id', userId)
+        .single();
 
-    if (error) {
-      console.error('Error updating Supabase:', error);
-      return res.status(500).send('Database update failed');
+      if (fetchError && fetchError.code !== 'PGRST116') { // Ignore "Row not found" error
+        console.error('Error fetching profile:', fetchError);
+        throw fetchError; 
+      }
+
+      if (existingProfile && existingProfile.payment_status === 'paid') {
+        console.log('⚠️ User already marked as paid. Skipping update.');
+        return res.json({ received: true });
+      }
+
+      // 2. UPDATE DATABASE (Service Role bypasses RLS)
+      const { error: updateError } = await supabase
+        .from('founder_profiles')
+        .update({
+          payment_status: 'paid',
+          stripe_session_id: stripeSessionId,
+          paid_at: new Date().toISOString()
+        })
+        .eq('user_id', userId);
+
+      if (updateError) {
+        console.error('❌ Database Update Failed:', updateError);
+        return res.status(500).send('Database update failed');
+      }
+
+      console.log('✅ Database updated successfully');
+
+    } catch (err) {
+      console.error('❌ Processing Error:', err);
+      return res.status(500).send('Internal Server Error');
     }
   }
 
+  // Return a 200 response to acknowledge receipt of the event
   res.json({ received: true });
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+// --- MIDDLEWARE: JSON PARSER (FOR ALL OTHER ROUTES) ---
+app.use(express.json());
+
+// --- ROUTE 2: CREATE CHECKOUT SESSION ---
+app.post('/create-checkout-session', async (req, res) => {
+  const { userId, email, companyName } = req.body;
+
+  // Basic Validation
+  if (!userId || !email) {
+    return res.status(400).json({ error: 'Missing userId or email' });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      customer_email: email,
+      client_reference_id: userId, // Links payment to user in Webhook
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: `Startup Verification: ${companyName || 'Founder'}`,
+              description: 'Official Investarise Global Event Pass & Verification',
+            },
+            unit_amount: 5000, // $50.00 (in cents)
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      // UPDATED REDIRECT URLS
+      success_url: `https://www.investariseglobal.com/founder-form-page?success=true`,
+      cancel_url: `https://www.investariseglobal.com/founder-form-page?canceled=true`,
+      metadata: {
+        company_name: companyName,
+        user_id: userId
+      }
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('❌ Error creating checkout session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- ROUTE 3: HEALTH CHECK ---
+app.get('/', (req, res) => {
+  res.send('Infispark Payment Server is Running 🚀');
+});
+
+// --- START SERVER ---
+app.listen(PORT, () => {
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`   - Webhook endpoint: http://localhost:${PORT}/webhook`);
+  console.log(`   - Checkout endpoint: http://localhost:${PORT}/create-checkout-session`);
+});
