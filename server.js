@@ -109,13 +109,14 @@ app.post('/create-checkout-session', async (req, res) => {
 
   if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
-  // Logic to switch price and return URL based on user type
-  let unitAmount = 5000; // Default Founder Price ($50.00)
+  // 1 INR = 100 Paise (Stripe requires amounts in the smallest currency unit)
+  let unitAmount = 100; 
+  
   let productName = `Startup Verification: ${companyName}`;
   let returnUrl = 'https://www.investariseglobal.com/founder-form-page';
 
   if (type === 'exhibitor') {
-    unitAmount = 20000; // Exhibitor Price ($200.00) - Change this to your desired amount
+    unitAmount = 100; // Also 1 INR for Exhibitor
     productName = `Exhibitor Registration: ${companyName}`;
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
@@ -127,12 +128,12 @@ app.post('/create-checkout-session', async (req, res) => {
       client_reference_id: userId,
       line_items: [{
         price_data: {
-          currency: 'usd',
+          currency: 'inr', // CHANGED FROM 'usd' TO 'inr'
           product_data: {
             name: productName,
             description: 'Official Investarise Global Event Pass',
           },
-          unit_amount: unitAmount,
+          unit_amount: unitAmount, // 100 paise = ₹1
         },
         quantity: 1,
       }],
@@ -142,7 +143,7 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type // Critical for webhook logic
+        user_type: type 
       }
     });
 
