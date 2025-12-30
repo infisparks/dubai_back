@@ -110,7 +110,7 @@ app.post('/create-checkout-session', async (req, res) => {
   // Stripe requires amount in cents (500 * 100 = 50000)
   let unitAmount = 50000; 
   let productName = `Startup Verification: ${companyName}`;
-  let returnUrl = 'https://www.investariseglobal.com/founder-form-page';
+  let returnUrl = 'https://www.investariseglobal.com/founder-form';
 
   if (type === 'exhibitor') {
     // 2. EXHIBITOR PRICE: 10,000 AED converted to USD
