@@ -59,7 +59,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const session = event.data.object;
     const userId = session.client_reference_id;
     const stripeSessionId = session.id;
-    // Check type from metadata (default to 'founder' if missing)
     const userType = session.metadata.user_type || 'founder'; 
 
     console.log(`💰 Payment success for ${userType}: ${userId}`);
@@ -67,7 +66,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     try {
       const tableName = userType === 'exhibitor' ? 'exhibitor_profiles' : 'founder_profiles';
 
-      // Idempotency Check
       const { data: existing } = await supabase
         .from(tableName)
         .select('payment_status')
@@ -79,7 +77,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         return res.json({ received: true });
       }
 
-      // Update Database
       const { error } = await supabase
         .from(tableName)
         .update({
@@ -109,13 +106,19 @@ app.post('/create-checkout-session', async (req, res) => {
 
   if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
-  // Logic to switch price and return URL based on user type
-  let unitAmount = 5000; // Default Founder Price ($50.00)
+  // 1. STARTUP PRICE: $500 USD
+  // Stripe requires amount in cents (500 * 100 = 50000)
+  let unitAmount = 50000; 
   let productName = `Startup Verification: ${companyName}`;
   let returnUrl = 'https://www.investariseglobal.com/founder-form-page';
 
   if (type === 'exhibitor') {
-    unitAmount = 20000; // Exhibitor Price ($200.00) - Change this to your desired amount
+    // 2. EXHIBITOR PRICE: 10,000 AED converted to USD
+    // Conversion Rate Approx: 3.67 AED = 1 USD
+    // 10,000 AED / 3.67 ≈ $2,725 USD (Rounded for safety)
+    // $2,725 USD in cents = 272500
+    unitAmount = 272500; 
+    
     productName = `Exhibitor Registration: ${companyName}`;
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
@@ -127,10 +130,12 @@ app.post('/create-checkout-session', async (req, res) => {
       client_reference_id: userId,
       line_items: [{
         price_data: {
-          currency: 'usd',
+          currency: 'usd', // Charging in USD
           product_data: {
             name: productName,
-            description: 'Official Investarise Global Event Pass',
+            description: type === 'exhibitor' 
+              ? 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)' 
+              : 'Official Investarise Global Startup Pass',
           },
           unit_amount: unitAmount,
         },
@@ -142,7 +147,7 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type // Critical for webhook logic
+        user_type: type
       }
     });
 
