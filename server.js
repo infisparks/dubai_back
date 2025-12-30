@@ -7,31 +7,25 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-/* ------------------ STRIPE INIT ------------------ */
+// Init Stripe
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('CRITICAL ERROR: STRIPE_SECRET_KEY is missing in .env');
   process.exit(1);
 }
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-/* ------------------ SUPABASE INIT ------------------ */
+// Init Supabase Admin
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error('CRITICAL ERROR: SUPABASE credentials missing in .env');
   process.exit(1);
 }
-
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
-    }
-  }
+  { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-/* ------------------ CORS ------------------ */
+// CORS Config
 const allowedOrigins = [
   'http://localhost:3000',
   'https://www.investariseglobal.com',
@@ -42,101 +36,88 @@ const allowedOrigins = [
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
-    if (!allowedOrigins.includes(origin)) {
+    if (allowedOrigins.indexOf(origin) === -1) {
       return callback(new Error('CORS Policy Error'), false);
     }
-    callback(null, true);
+    return callback(null, true);
   }
 }));
 
-/* ------------------ STRIPE WEBHOOK ------------------ */
-app.post(
-  '/webhook',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
+// --- STRIPE WEBHOOK ---
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error(`Webhook Error: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.client_reference_id;
+    const stripeSessionId = session.id;
+    // Check type from metadata (default to 'founder' if missing)
+    const userType = session.metadata.user_type || 'founder'; 
+
+    console.log(`💰 Payment success for ${userType}: ${userId}`);
 
     try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error('Webhook Error:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+      const tableName = userType === 'exhibitor' ? 'exhibitor_profiles' : 'founder_profiles';
 
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
+      // Idempotency Check
+      const { data: existing } = await supabase
+        .from(tableName)
+        .select('payment_status')
+        .eq('user_id', userId)
+        .single();
 
-      const userId = session.client_reference_id;
-      const stripeSessionId = session.id;
-      const userType = session.metadata.user_type || 'founder';
-
-      console.log(`💰 Payment success for ${userType}: ${userId}`);
-
-      try {
-        const tableName =
-          userType === 'exhibitor'
-            ? 'exhibitor_profiles'
-            : 'founder_profiles';
-
-        // Idempotency check
-        const { data: existing } = await supabase
-          .from(tableName)
-          .select('payment_status')
-          .eq('user_id', userId)
-          .single();
-
-        if (existing?.payment_status === 'paid') {
-          console.log('⚠️ Payment already processed, skipping update');
-          return res.json({ received: true });
-        }
-
-        const { error } = await supabase
-          .from(tableName)
-          .update({
-            payment_status: 'paid',
-            stripe_session_id: stripeSessionId,
-            paid_at: new Date().toISOString()
-          })
-          .eq('user_id', userId);
-
-        if (error) throw error;
-
-        console.log(`✅ ${tableName} updated successfully`);
-      } catch (err) {
-        console.error('❌ Database Update Error:', err);
-        return res.status(500).send('Database Error');
+      if (existing && existing.payment_status === 'paid') {
+        console.log('⚠️ Already paid, skipping update.');
+        return res.json({ received: true });
       }
-    }
 
-    res.json({ received: true });
+      // Update Database
+      const { error } = await supabase
+        .from(tableName)
+        .update({
+          payment_status: 'paid',
+          stripe_session_id: stripeSessionId,
+          paid_at: new Date().toISOString()
+        })
+        .eq('user_id', userId);
+
+      if (error) throw error;
+      console.log(`✅ ${tableName} updated successfully`);
+
+    } catch (err) {
+      console.error('❌ Database Update Error:', err);
+      return res.status(500).send('Database Error');
+    }
   }
-);
+
+  res.json({ received: true });
+});
 
 app.use(express.json());
 
-/* ------------------ CHECKOUT SESSION ------------------ */
+// --- CHECKOUT ENDPOINT ---
 app.post('/create-checkout-session', async (req, res) => {
-  const { userId, email, companyName, type } = req.body;
+  const { userId, email, companyName, type } = req.body; 
 
-  if (!userId || !email) {
-    return res.status(400).json({ error: 'Missing data' });
-  }
+  if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
-  // ₹1 PAYMENT FOR BOTH
-  const unitAmount = 100; // ₹1 = 100 paise
-  const currency = 'inr';
-
+  // Logic to switch price and return URL based on user type
+  let unitAmount = 5000; // Default Founder Price ($50.00)
   let productName = `Startup Verification: ${companyName}`;
   let returnUrl = 'https://www.investariseglobal.com/founder-form-page';
 
   if (type === 'exhibitor') {
+    unitAmount = 20000; // Exhibitor Price ($200.00) - Change this to your desired amount
     productName = `Exhibitor Registration: ${companyName}`;
-    returnUrl = 'https://www.investariseglobal.com/exhibitor-form';
+    returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
 
   try {
@@ -144,26 +125,24 @@ app.post('/create-checkout-session', async (req, res) => {
       payment_method_types: ['card'],
       customer_email: email,
       client_reference_id: userId,
-      line_items: [
-        {
-          price_data: {
-            currency,
-            product_data: {
-              name: productName,
-              description: 'Official Investarise Global Event Pass'
-            },
-            unit_amount: unitAmount
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: productName,
+            description: 'Official Investarise Global Event Pass',
           },
-          quantity: 1
-        }
-      ],
+          unit_amount: unitAmount,
+        },
+        quantity: 1,
+      }],
       mode: 'payment',
       success_url: `${returnUrl}?success=true`,
       cancel_url: `${returnUrl}?canceled=true`,
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type || 'founder'
+        user_type: type // Critical for webhook logic
       }
     });
 
@@ -174,7 +153,4 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 });
 
-/* ------------------ SERVER START ------------------ */
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
