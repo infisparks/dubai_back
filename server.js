@@ -108,7 +108,7 @@ app.post('/create-checkout-session', async (req, res) => {
 
   // 1. STARTUP PRICE: $500 USD
   // Stripe requires amount in cents (500 * 100 = 50000)
-  let unitAmount = 50000; 
+  let unitAmount = 1000; 
   let productName = `Startup Verification: ${companyName}`;
   let returnUrl = 'https://www.investariseglobal.com/founder-form';
 
