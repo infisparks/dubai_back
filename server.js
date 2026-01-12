@@ -7,14 +7,13 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Init Stripe
+// --- CONFIGURATION CHECKS ---
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('CRITICAL ERROR: STRIPE_SECRET_KEY is missing in .env');
   process.exit(1);
 }
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Init Supabase Admin
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error('CRITICAL ERROR: SUPABASE credentials missing in .env');
   process.exit(1);
@@ -25,7 +24,7 @@ const supabase = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// CORS Config
+// --- CORS ---
 const allowedOrigins = [
   'http://localhost:3000',
   'https://www.investariseglobal.com',
@@ -59,16 +58,25 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const session = event.data.object;
     const userId = session.client_reference_id;
     const stripeSessionId = session.id;
-    const userType = session.metadata.user_type || 'founder';
     
-    // Extract is_gala from metadata (stored as string 'true'/'false')
-    const isGala = session.metadata.is_gala === 'true';
+    // Retrieve metadata
+    const userType = session.metadata.user_type || 'founder'; 
+    const isGala = session.metadata.is_gala === 'true'; // Only relevant for founders
 
-    console.log(`💰 Payment success for ${userType} (Gala: ${isGala}): ${userId}`);
+    console.log(`💰 Payment success for [${userType}]: ${userId}`);
 
     try {
-      const tableName = userType === 'exhibitor' ? 'exhibitor_profiles' : 'founder_profiles';
+      // 1. Determine which table to update based on userType
+      let tableName;
+      if (userType === 'exhibitor') {
+        tableName = 'exhibitor_profiles';
+      } else if (userType === 'pitching') {
+        tableName = 'pitching_profiles';
+      } else {
+        tableName = 'founder_profiles';
+      }
 
+      // 2. Check if already paid to prevent duplicate processing
       const { data: existing } = await supabase
         .from(tableName)
         .select('payment_status')
@@ -80,25 +88,26 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         return res.json({ received: true });
       }
 
-      // Prepare update object
+      // 3. Prepare Update Data
       const updateData = {
         payment_status: 'paid',
         stripe_session_id: stripeSessionId,
         paid_at: new Date().toISOString()
       };
 
-      // Only update is_gala if it is a founder
+      // Only add is_gala if it is the founder table
       if (userType === 'founder') {
         updateData.is_gala = isGala;
       }
 
+      // 4. Update Supabase
       const { error } = await supabase
         .from(tableName)
         .update(updateData)
         .eq('user_id', userId);
 
       if (error) throw error;
-      console.log(`✅ ${tableName} updated successfully`);
+      console.log(`✅ ${tableName} updated successfully for user ${userId}`);
 
     } catch (err) {
       console.error('❌ Database Update Error:', err);
@@ -111,32 +120,42 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
 app.use(express.json());
 
-// --- CHECKOUT ENDPOINT ---
+// --- CREATE CHECKOUT SESSION ---
 app.post('/create-checkout-session', async (req, res) => {
-  // Added isGala to destructuring
   const { userId, email, companyName, type, isGala } = req.body; 
 
   if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
-  let unitAmount = 50000; // Default Founder Price: $500.00 (in cents)
+  // Default values (Founder)
+  let unitAmount = 50000; // $500.00 in cents
   let productName = `Startup Verification: ${companyName}`;
   let description = 'Official Investarise Global Startup Pass';
   let returnUrl = 'https://www.investariseglobal.com/founder-form';
 
-  // --- PRICING LOGIC ---
-  if (type === 'founder') {
-    if (isGala) {
-      // Base ($500) + Gala ($500) = $1000
-      unitAmount = 100000; 
-      productName = `Founder Pass + Gala Dinner: ${companyName}`;
-      description = 'Official Startup Pass including Networking Gala Dinner';
-    }
-  } else if (type === 'exhibitor') {
-    // EXHIBITOR PRICE: 10,000 AED approx $2,725 USD
-    unitAmount = 272500; 
+  // --- LOGIC SWITCH BASED ON TYPE ---
+  
+  // 1. PITCHING ($2,500)
+  if (type === 'pitching') {
+    unitAmount = 250000; // $2500.00 * 100
+    productName = `Pitching Slot: ${companyName}`;
+    description = 'Official 10-minute Pitching Slot + Startup Pass';
+    returnUrl = 'https://www.investariseglobal.com/pitching-form';
+  }
+  // 2. EXHIBITOR (~$2,725 / 10k AED)
+  else if (type === 'exhibitor') {
+    unitAmount = 272500; // ~$2,725.00 * 100
     productName = `Exhibitor Registration: ${companyName}`;
     description = 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)';
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
+  }
+  // 3. FOUNDER ($500 base + optional $500 Gala)
+  else if (type === 'founder') {
+    // Keep defaults, but check for Gala
+    if (isGala) {
+      unitAmount = 100000; // $1000.00 * 100
+      productName = `Founder Pass + Gala Dinner: ${companyName}`;
+      description = 'Official Startup Pass including Networking Gala Dinner';
+    }
   }
 
   try {
@@ -161,9 +180,8 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type,
-        // Pass isGala to metadata so we can retrieve it in the webhook
-        is_gala: isGala ? 'true' : 'false' 
+        user_type: type || 'founder', // 'founder', 'exhibitor', or 'pitching'
+        is_gala: isGala ? 'true' : 'false' // Stored as string
       }
     });
 
