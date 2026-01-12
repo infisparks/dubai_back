@@ -59,9 +59,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const session = event.data.object;
     const userId = session.client_reference_id;
     const stripeSessionId = session.id;
-    const userType = session.metadata.user_type || 'founder'; 
+    const userType = session.metadata.user_type || 'founder';
+    
+    // Extract is_gala from metadata (stored as string 'true'/'false')
+    const isGala = session.metadata.is_gala === 'true';
 
-    console.log(`💰 Payment success for ${userType}: ${userId}`);
+    console.log(`💰 Payment success for ${userType} (Gala: ${isGala}): ${userId}`);
 
     try {
       const tableName = userType === 'exhibitor' ? 'exhibitor_profiles' : 'founder_profiles';
@@ -77,13 +80,21 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         return res.json({ received: true });
       }
 
+      // Prepare update object
+      const updateData = {
+        payment_status: 'paid',
+        stripe_session_id: stripeSessionId,
+        paid_at: new Date().toISOString()
+      };
+
+      // Only update is_gala if it is a founder
+      if (userType === 'founder') {
+        updateData.is_gala = isGala;
+      }
+
       const { error } = await supabase
         .from(tableName)
-        .update({
-          payment_status: 'paid',
-          stripe_session_id: stripeSessionId,
-          paid_at: new Date().toISOString()
-        })
+        .update(updateData)
         .eq('user_id', userId);
 
       if (error) throw error;
@@ -102,24 +113,29 @@ app.use(express.json());
 
 // --- CHECKOUT ENDPOINT ---
 app.post('/create-checkout-session', async (req, res) => {
-  const { userId, email, companyName, type } = req.body; 
+  // Added isGala to destructuring
+  const { userId, email, companyName, type, isGala } = req.body; 
 
   if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
-  // 1. STARTUP PRICE: $500 USD
-  // Stripe requires amount in cents (500 * 100 = 50000)
-  let unitAmount = 50000; 
+  let unitAmount = 50000; // Default Founder Price: $500.00 (in cents)
   let productName = `Startup Verification: ${companyName}`;
+  let description = 'Official Investarise Global Startup Pass';
   let returnUrl = 'https://www.investariseglobal.com/founder-form';
 
-  if (type === 'exhibitor') {
-    // 2. EXHIBITOR PRICE: 10,000 AED converted to USD
-    // Conversion Rate Approx: 3.67 AED = 1 USD
-    // 10,000 AED / 3.67 ≈ $2,725 USD (Rounded for safety)
-    // $2,725 USD in cents = 272500
+  // --- PRICING LOGIC ---
+  if (type === 'founder') {
+    if (isGala) {
+      // Base ($500) + Gala ($500) = $1000
+      unitAmount = 100000; 
+      productName = `Founder Pass + Gala Dinner: ${companyName}`;
+      description = 'Official Startup Pass including Networking Gala Dinner';
+    }
+  } else if (type === 'exhibitor') {
+    // EXHIBITOR PRICE: 10,000 AED approx $2,725 USD
     unitAmount = 272500; 
-    
     productName = `Exhibitor Registration: ${companyName}`;
+    description = 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)';
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
 
@@ -130,12 +146,10 @@ app.post('/create-checkout-session', async (req, res) => {
       client_reference_id: userId,
       line_items: [{
         price_data: {
-          currency: 'usd', // Charging in USD
+          currency: 'usd',
           product_data: {
             name: productName,
-            description: type === 'exhibitor' 
-              ? 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)' 
-              : 'Official Investarise Global Startup Pass',
+            description: description,
           },
           unit_amount: unitAmount,
         },
@@ -147,7 +161,9 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type
+        user_type: type,
+        // Pass isGala to metadata so we can retrieve it in the webhook
+        is_gala: isGala ? 'true' : 'false' 
       }
     });
 
