@@ -72,6 +72,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         tableName = 'exhibitor_profiles';
       } else if (userType === 'pitching') {
         tableName = 'pitching_profiles';
+      } else if (userType === 'visitor') {
+        // [UPDATED] Added mapping for visitor_profiles
+        tableName = 'visitor_profiles';
       } else {
         tableName = 'founder_profiles';
       }
@@ -148,7 +151,16 @@ app.post('/create-checkout-session', async (req, res) => {
     description = 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)';
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
-  // 3. FOUNDER ($500 base + optional $500 Gala)
+  // 3. VISITOR ($500)
+  else if (type === 'visitor') {
+    // [UPDATED] Logic for Visitor type
+    unitAmount = 50000; // $500.00 * 100
+    // Note: 'companyName' maps to 'fullName' from the frontend visitor form
+    productName = `Visitor Access Pass: ${companyName}`; 
+    description = 'Official Investarise Global Visitor Pass (Standard Access)';
+    returnUrl = 'https://www.investariseglobal.com/visitor-form';
+  }
+  // 4. FOUNDER ($500 base + optional $500 Gala)
   else if (type === 'founder') {
     // Keep defaults, but check for Gala
     if (isGala) {
@@ -180,8 +192,8 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type || 'founder', // 'founder', 'exhibitor', or 'pitching'
-        is_gala: isGala ? 'true' : 'false' // Stored as string
+        user_type: type || 'founder', // 'founder', 'exhibitor', 'pitching', or 'visitor'
+        is_gala: isGala ? 'true' : 'false'
       }
     });
 
