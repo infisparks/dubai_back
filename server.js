@@ -61,7 +61,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     
     // Retrieve metadata
     const userType = session.metadata.user_type || 'founder'; 
-    const isGala = session.metadata.is_gala === 'true'; // Only relevant for founders
+    const isGala = session.metadata.is_gala === 'true'; // Founder specific
+    const ticketType = session.metadata.ticket_type; // Visitor specific
 
     console.log(`💰 Payment success for [${userType}]: ${userId}`);
 
@@ -72,6 +73,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         tableName = 'exhibitor_profiles';
       } else if (userType === 'pitching') {
         tableName = 'pitching_profiles';
+      } else if (userType === 'visitor') {
+        tableName = 'visitor_profiles';
       } else {
         tableName = 'founder_profiles';
       }
@@ -95,9 +98,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         paid_at: new Date().toISOString()
       };
 
-      // Only add is_gala if it is the founder table
+      // Type-specific field updates
       if (userType === 'founder') {
         updateData.is_gala = isGala;
+      } else if (userType === 'visitor' && ticketType) {
+        // Ensure the database reflects the ticket type actually paid for
+        updateData.ticket_type = ticketType;
       }
 
       // 4. Update Supabase
@@ -122,7 +128,8 @@ app.use(express.json());
 
 // --- CREATE CHECKOUT SESSION ---
 app.post('/create-checkout-session', async (req, res) => {
-  const { userId, email, companyName, type, isGala } = req.body; 
+  // Added ticketType to destructuring
+  const { userId, email, companyName, type, isGala, ticketType } = req.body; 
 
   if (!userId || !email) return res.status(400).json({ error: 'Missing data' });
 
@@ -148,7 +155,22 @@ app.post('/create-checkout-session', async (req, res) => {
     description = 'Official Investarise Global Exhibitor Pass (approx. 10,000 AED)';
     returnUrl = 'https://www.investariseglobal.com/exhibitor-form'; 
   }
-  // 3. FOUNDER ($500 base + optional $500 Gala)
+  // 3. VISITOR ($250 Standard / $500 Premium) -- NEW SECTION --
+  else if (type === 'visitor') {
+    returnUrl = 'https://www.investariseglobal.com/visitor-form'; // Assumed route based on naming convention
+    
+    if (ticketType === 'premium') {
+        unitAmount = 50000; // $500.00 * 100
+        productName = `Visitor Premium VIP Access: ${companyName}`; // companyName here is the Visitor Name from frontend
+        description = 'Includes Gala Dinner, Lunch, Dinner, and Full Day VIP Access';
+    } else {
+        // Default to Standard
+        unitAmount = 25000; // $250.00 * 100
+        productName = `Visitor Standard Access Pass: ${companyName}`;
+        description = 'Includes Lunch, Dinner, and Full Day Event Access';
+    }
+  }
+  // 4. FOUNDER ($500 base + optional $500 Gala)
   else if (type === 'founder') {
     // Keep defaults, but check for Gala
     if (isGala) {
@@ -180,8 +202,9 @@ app.post('/create-checkout-session', async (req, res) => {
       metadata: {
         company_name: companyName,
         user_id: userId,
-        user_type: type || 'founder', // 'founder', 'exhibitor', or 'pitching'
-        is_gala: isGala ? 'true' : 'false' // Stored as string
+        user_type: type || 'founder', // 'founder', 'exhibitor', 'pitching', or 'visitor'
+        is_gala: isGala ? 'true' : 'false',
+        ticket_type: ticketType || '' // Store ticket type (standard/premium) for visitors
       }
     });
 
